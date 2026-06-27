@@ -57,4 +57,8 @@ TaskSchedulerGetFn: 0x4613468
 TaskSchedulerStepMarker: 0x4613468
 TaskSchedulerArbiterFail: 0x46131A0
 TaskSchedulerTargetFps: 0x4615A8C
-TaskSchedulerInstancePtr: 0x621BC18```
+TaskSchedulerInstancePtr: 0x621BC18
+luau_execute: 0x42F4E9C
+luaD_throw: 0x42E3BA8
+luaC_step: 0x42E57A0
+```
