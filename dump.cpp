@@ -606,6 +606,155 @@ int main(int argc, char** argv) {
         if (ios_scans[i].name == "TaskSchedulerGetFn") { ts_get_fn = results[i]; break; }
     }
     uintptr_t ts_singleton = larp(ts_get_fn);
+    uintptr_t luaD_throw = 0;
+    auto exc_matches = iosrscoop_mem::find_str_all("13lua_exception");
+    if (!exc_matches.empty()) {
+        uint64_t delta = iosrscoop_mem::text_vmaddr - iosrscoop_mem::text_fileoff;
+        uint64_t str_VA = exc_matches[0] + delta;
+        uintptr_t tinfo_VA = 0;
+        for (size_t i = 0; i <= iosrscoop_mem::size - 16; i += 8) {
+            if (*(uint64_t*)(iosrscoop_mem::data + i) == str_VA) {
+                tinfo_VA = i - 8 + delta;
+                break;
+            }
+        }
+        if (tinfo_VA) {
+            auto tinfo_xrefs = iosrscoop_mem::find_xrefs(tinfo_VA - delta);
+            if (!tinfo_xrefs.empty()) {
+                luaD_throw = iosrscoop_mem::find_func(tinfo_xrefs[0]);
+            }
+        }
+    }
+    uintptr_t luau_execute = 0;
+    uintptr_t lua_resume = 0;
+    for (size_t i = 0; i < ios_scans.size(); ++i) {
+        if (ios_scans[i].name == "LuaResume") { lua_resume = results[i]; break; }
+    }
+    if (lua_resume) {
+        size_t end_resume = lua_resume + 4;
+        while (end_resume < iosrscoop_mem::text_end) {
+            uint32_t insn = *(uint32_t*)(iosrscoop_mem::data + end_resume);
+            if (iosrscoop_mem::is_func_prologue(insn)) break;
+            end_resume += 4;
+        }
+
+        std::vector<uintptr_t> tail_targets;
+        for (size_t pc = lua_resume; pc < end_resume; pc += 4) {
+            uint32_t insn = *(uint32_t*)(iosrscoop_mem::data + pc);
+            if ((insn & 0xFC000000) == 0x14000000) { // b
+                uintptr_t target = decode_bl(insn, pc);
+                if (target >= iosrscoop_mem::text_start && target < iosrscoop_mem::text_end) {
+                    if (target < lua_resume || target >= end_resume) {
+                        tail_targets.push_back(target);
+                    }
+                }
+            }
+        }
+
+        for (uintptr_t tail_target : tail_targets) {
+            size_t end_tail = tail_target + 4;
+            while (end_tail < iosrscoop_mem::text_end) {
+                uint32_t insn = *(uint32_t*)(iosrscoop_mem::data + end_tail);
+                if (iosrscoop_mem::is_func_prologue(insn)) break;
+                end_tail += 4;
+            }
+
+            std::vector<uintptr_t> bl_targets;
+            for (size_t pc = tail_target; pc < end_tail; pc += 4) {
+                uint32_t insn = *(uint32_t*)(iosrscoop_mem::data + pc);
+                if (is_bl(insn)) {
+                    uintptr_t target = decode_bl(insn, pc);
+                    if (target >= iosrscoop_mem::text_start && target < iosrscoop_mem::text_end) {
+                        bl_targets.push_back(target);
+                    }
+                }
+            }
+
+            for (uintptr_t t : bl_targets) {
+                int count = 0;
+                for (size_t pc = t; pc < t + 4000 && pc < iosrscoop_mem::text_end; pc += 4) {
+                    uint32_t insn = *(uint32_t*)(iosrscoop_mem::data + pc);
+                    if ((insn & 0xffc00c00) == 0xb8400400) {
+                        uint32_t rt = insn & 0x1f;
+                        uint32_t rn = (insn >> 5) & 0x1f;
+                        uint32_t imm9 = (insn >> 12) & 0x1ff;
+                        if (rt != 31 && rn != 31 && imm9 == 4) {
+                            count++;
+                        }
+                    }
+                }
+                if (count > 10) {
+                    luau_execute = t;
+                    break;
+                }
+            }
+            if (luau_execute) break;
+        }
+    }
+
+    // 3. Resolve luaC_step
+    uintptr_t luaC_step = 0;
+    if (lua_resume) {
+        uintptr_t luau_range_start = (lua_resume >= 0x30000) ? lua_resume - 0x30000 : iosrscoop_mem::text_start;
+        uintptr_t luau_range_end = std::min(lua_resume + 0x30000, (uintptr_t)iosrscoop_mem::text_end);
+
+        struct GCFunction {
+            uintptr_t addr;
+            std::vector<uintptr_t> calls;
+        };
+        std::vector<GCFunction> gc_funcs;
+
+        uintptr_t curr_func = 0;
+        bool has_gc_offsets = false;
+        std::vector<uintptr_t> bl_calls;
+
+        for (size_t pc = luau_range_start; pc < luau_range_end; pc += 4) {
+            uint32_t insn = *(uint32_t*)(iosrscoop_mem::data + pc);
+            if (iosrscoop_mem::is_func_prologue(insn)) {
+                if (curr_func != 0 && has_gc_offsets) {
+                    gc_funcs.push_back({curr_func, bl_calls});
+                }
+                curr_func = pc;
+                has_gc_offsets = false;
+                bl_calls.clear();
+            }
+
+            if (curr_func != 0) {
+                uint32_t op = insn & 0xffc00000;
+                if (op == 0xf9400000 || op == 0xf9000000) {
+                    uint32_t imm = ((insn >> 10) & 0xfff) << 3;
+                    if (imm >= 0x4400 && imm <= 0x4750) {
+                        has_gc_offsets = true;
+                    }
+                } else if (is_bl(insn)) {
+                    uintptr_t target = decode_bl(insn, pc);
+                    if (target >= iosrscoop_mem::text_start && target < iosrscoop_mem::text_end) {
+                        bl_calls.push_back(target);
+                    }
+                }
+            }
+        }
+        if (curr_func != 0 && has_gc_offsets) {
+            gc_funcs.push_back({curr_func, bl_calls});
+        }
+
+        for (const auto& gf1 : gc_funcs) {
+            int call_count = 0;
+            for (const auto& gf2 : gc_funcs) {
+                if (gf1.addr == gf2.addr) continue;
+                for (uintptr_t target : gf2.calls) {
+                    if (target == gf1.addr) {
+                        call_count++;
+                        break;
+                    }
+                }
+            }
+            if (call_count >= 1) {
+                luaC_step = gf1.addr;
+                break;
+            }
+        }
+    }
 
     std::cout << std::hex << std::uppercase;
     for (size_t i = 0; i < ios_scans.size(); ++i) {
@@ -616,7 +765,19 @@ int main(int argc, char** argv) {
 
     std::cout << "TaskSchedulerInstancePtr: ";
     if (ts_singleton) std::cout << "0x" << ts_singleton << "\n";
-    else std::cout << "not found\n";
+    else std::cout << "NOT_FOUND\n";
+
+    std::cout << "luau_execute: ";
+    if (luau_execute) std::cout << "0x" << luau_execute << "\n";
+    else std::cout << "NOT_FOUND\n";
+
+    std::cout << "luaD_throw: ";
+    if (luaD_throw) std::cout << "0x" << luaD_throw << "\n";
+    else std::cout << "NOT_FOUND\n";
+
+    std::cout << "luaC_step: ";
+    if (luaC_step) std::cout << "0x" << luaC_step << "\n";
+    else std::cout << "NOT_FOUND\n";
 
     return 0;
 }
