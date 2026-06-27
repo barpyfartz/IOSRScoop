@@ -561,10 +561,31 @@ int main(int argc, char** argv) {
     if (argc < 2) return 1;
 
     std::vector<uint8_t> binary_buffer;
-    if (!extract_roblox_lib(argv[1], binary_buffer)) {
-        std::ifstream f(argv[1], std::ios::binary);
-        if (!f) return 1;
-        binary_buffer.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    std::string version = "";
+    {
+        std::vector<uint8_t> zip_data;
+        if (read_entire_file(argv[1], zip_data)) {
+            if (!extract_file_from_zip(zip_data, "Payload/Roblox.app/Frameworks/RobloxLib.framework/RobloxLib", binary_buffer)) {
+                binary_buffer = zip_data;
+            } else {
+                std::vector<uint8_t> info_plist_data;
+                if (extract_file_from_zip(zip_data, "Payload/Roblox.app/Info.plist", info_plist_data)) {
+                    std::string content((char*)info_plist_data.data(), info_plist_data.size());
+                    size_t key_pos = content.find("<key>CFBundleShortVersionString</key>");
+                    if (key_pos != std::string::npos) {
+                        size_t str_pos = content.find("<string>", key_pos);
+                        if (str_pos != std::string::npos) {
+                            size_t end_pos = content.find("</string>", str_pos);
+                            if (end_pos != std::string::npos) {
+                                version = content.substr(str_pos + 8, end_pos - (str_pos + 8));
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            return 1;
+        }
     }
 
     if (!iosrscoop_mem::load_mach_o(binary_buffer)) return 1;
@@ -778,6 +799,10 @@ int main(int argc, char** argv) {
     std::cout << "luaC_step: ";
     if (luaC_step) std::cout << "0x" << luaC_step << "\n";
     else std::cout << "NOT_FOUND\n";
+
+    if (!version.empty()) {
+        std::cout << "Version - " << version << "\n";
+    }
 
     return 0;
 }
